@@ -6,6 +6,9 @@ import (
 	"github.com/fajarmf10/transactions-aggregates/internal/money"
 	"github.com/fajarmf10/transactions-aggregates/internal/transaction"
 )
+
+const MaxWindow = 90 * day
+
 const day = 24 * time.Hour
 
 type Window struct {
@@ -45,7 +48,7 @@ func Aggregate(txns []transaction.Transaction, now time.Time) Aggregations {
 
 	for _, tx := range txns {
 		age := now.Sub(tx.OccurredAt)
-		if age > 90*day {
+		if age > MaxWindow {
 			continue
 		}
 		w90d.add(tx.Amount)
