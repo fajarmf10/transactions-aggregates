@@ -1,6 +1,11 @@
 package main
 
-import "os"
+import (
+	"log"
+	"os"
+
+	"github.com/joho/godotenv"
+)
 
 type config struct {
 	databaseURL string
@@ -8,6 +13,10 @@ type config struct {
 }
 
 func loadConfig() config {
+	if err := godotenv.Load(); err != nil {
+		log.Printf("note: .env not loaded (%v); using existing environment", err)
+	}
+
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
 		addr = ":8080"
