@@ -256,3 +256,116 @@ Suppose an API caller wants durations like **`7d`** or **`14d`** that are not fr
 With our current design, we load up to 90 days of a user's transactions, then compute totals in Go. To support a custom range (for example **7d** or **14d** instead of the fixed 15m / 1h / 24h presets), we mostly change the cutoff time (`occurred_at >= now - duration`). The API could accept a window length per request, or alongside the fixed windows.
 
 The limit is retention: we only fetch what we store. A window longer than 90 days requires fetching more history from the database (a wider `SELECT`), not just a different comparison in memory.
+
+## Future scaling direction: Kafka-backed aggregation
+
+For traffic beyond what the PostgreSQL-centered design can comfortably handle, the architecture can move toward Kafka-backed aggregation. The goal is still a synchronous `POST /transactions` response, but durability and hot aggregation are split across two parts:
+
+- Kafka is the durable transaction log
+- The API service owns hot in-memory aggregation state for its assigned Kafka partitions
+
+The main rule is: **the API must not return success until the transaction event has been appended to Kafka and applied to the in-memory aggregate state**.
+
+### Big picture
+
+```text
+HTTP client
+  |
+  v
+API service responsible for the user's partition
+  |
+  | 1. validate request
+  | 2. choose partition from user_id
+  | 3. append transaction.accepted to Kafka with strong acks
+  v
+Kafka-compatible topic: transactions
+  partition 00: user_id hash range A
+  partition 01: user_id hash range B
+  partition 02: user_id hash range C
+  ...
+  |
+  | replay on startup / recovery
+  v
+API service in-memory state for owned partitions
+  - rolling count/sum buckets per user
+  - dedupe state by transaction_id
+  - last applied Kafka offset per partition
+  |
+  | 4. apply event to memory
+  | 5. compute current windows from buckets
+  v
+HTTP 201 response with 15m / 1h / 24h / 30d / 90d aggregations
+```
+
+The request is still synchronous. Kafka replaces Postgres as the durable write on the hot path, then memory gives the response its current aggregate view.
+
+### Event format
+
+Each accepted transaction is written as one immutable event. The Kafka message key is `user_id`, so one user's events stay ordered inside one partition.
+
+```text
+topic: transactions
+key:   user_id
+value: JSON
+```
+
+Example value:
+
+```json
+{
+  "event_type": "transaction.accepted",
+  "schema_version": 1,
+  "transaction_id": "txn_abc123",
+  "user_id": "user_42",
+  "amount": "150000.00",
+  "occurred_at": "2026-05-24T05:00:00Z",
+  "accepted_at": "2026-05-24T05:00:01Z"
+}
+```
+
+### Partitioning and ownership
+
+Partitioning is the sharding mechanism:
+
+```text
+partition = hash(user_id) % partition_count
+
+user_42 -> partition 03 -> service instance that owns partition 03
+user_99 -> partition 11 -> service instance that owns partition 11
+user_18 -> partition 03 -> same instance as user_42, separate user state
+```
+
+This is because if two service instances accept writes for the same user independently, they can produce different in-memory. The production needs either a gateway that routes each user to the instance owning the partition, or an internal forwarding layer that sends the request to the owner before appending/applying.
+
+### In-memory aggregate state
+
+The API process does not keep all raw transactions in memory. It keeps compact rolling state:
+
+```text
+partition 03
+  user_42
+    seen transaction identifiers:
+      txn_abc123
+      txn_def456
+
+    minute buckets:
+      10:00 -> count=20, sum=3000.00
+      10:01 -> count=18, sum=2700.00
+
+    hour buckets:
+      2026-05-24 09:00 -> count=900, sum=135000.00
+      2026-05-24 10:00 -> count=820, sum=123000.00
+```
+
+When a new event is applied, the state updates the relevant time bucket for that user. The response is computed by summing the buckets that overlap the requested windows. This avoids rescanning old raw transaction rows on every request.
+
+### Downstream storage
+
+Postgres can still exist, but it is no longer the hot aggregation dependency for `POST /transactions`. It becomes a downstream consumer for another operations, or long-term query history.
+
+```text
+Kafka topic: transactions
+  -> hot aggregation service for synchronous responses
+  -> Postgres sink for durable query/archive tables
+  -> analytics/fraud/monitoring consumers
+```
